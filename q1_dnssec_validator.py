@@ -265,10 +265,8 @@ def fetch_ds(domain: str, server_ip: Optional[str] = None) -> list:
     if server_ip is None:
         server_ip = _get_default_resolver_ip()
 
-    # Find parent zone by stripping leftmost label
-    parts = domain.rstrip(".").split(".")
-    if len(parts) <= 1:
-        # Root zone: use built-in trust anchor, return empty (handled separately)
+    # Root zone has no parent — DS is handled separately via the trust anchor
+    if domain.rstrip(".") in ("", "."):
         return []
 
     # Query parent nameservers for DS

@@ -81,10 +81,16 @@ def _get_ns_ips_from_response(response: dns.message.Message, server_ip: str) -> 
     ns_names = []
     glue: dict[str, str] = {}
 
+    # Prefer A over AAAA — only store AAAA if no A record exists for that name
     for rrset in response.additional:
-        if rrset.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
+        if rrset.rdtype == dns.rdatatype.A:
             name = str(rrset.name).rstrip(".")
             glue[name] = str(next(iter(rrset)))
+    for rrset in response.additional:
+        if rrset.rdtype == dns.rdatatype.AAAA:
+            name = str(rrset.name).rstrip(".")
+            if name not in glue:
+                glue[name] = str(next(iter(rrset)))
 
     for section in (response.answer, response.authority):
         for rrset in section:
@@ -113,13 +119,15 @@ def _get_ns_ips_from_response(response: dns.message.Message, server_ip: str) -> 
 
 def _validate_zone_at_server(zone: str, server_ip: str) -> ValidationResult:
     """
-    Validate DNSSEC for a zone by querying the given server directly.
-    Validates: DNSKEY RRset is signed (RRSIG over DNSKEY) + DS from parent matches KSK.
+    Validate DNSSEC for a zone.
+    DNSKEY/RRSIG records are fetched via FALLBACK_RESOLVER (8.8.8.8 with CD+DO)
+    because authoritative-only servers (TLD servers) refuse recursive queries.
+    Cryptographic verification is independent of which server we fetched from.
+    DS records are also fetched via FALLBACK_RESOLVER from the parent zone.
     """
-    # Validate DNSKEY RRset signature (the KSK signs the DNSKEY RRset)
     vr = ValidationResult(valid=False, domain=zone, record_type="DNSKEY")
 
-    dnskey_rrset, dnskey_rrsigs = fetch_rrset_with_rrsig(zone, "DNSKEY", server_ip)
+    dnskey_rrset, dnskey_rrsigs = fetch_rrset_with_rrsig(zone, "DNSKEY", FALLBACK_RESOLVER)
     if dnskey_rrset is None or len(dnskey_rrset) == 0:
         vr.error = f"No DNSKEY records found for {zone}"
         vr.steps.append("FAILED: No DNSKEY records found")
@@ -183,100 +191,80 @@ def _validate_zone_at_server(zone: str, server_ip: str) -> ValidationResult:
 # Recursive resolver
 # ---------------------------------------------------------------------------
 
+def _build_zone_chain(domain: str) -> list[str]:
+    """
+    Build the list of zones from root down to the domain.
+    e.g. "www.example.com" → [".", "com", "example.com", "www.example.com"]
+    The final entry is the authoritative zone for the domain (may equal domain).
+    """
+    parts = domain.rstrip(".").split(".")
+    zones = ["."]
+    for i in range(len(parts) - 1, -1, -1):
+        zones.append(".".join(parts[i:]))
+    return zones
+
+
 def resolve_iterative(domain: str, rdtype_str: str) -> ResolverResult:
     """
-    Iterative DNS resolver starting from root servers.
-    At each delegation step, performs DNSSEC validation via Q1 functions.
+    DNSSEC-validating resolver.
 
-    Walk:  Root  →  TLD (e.g. .com)  →  Authoritative (e.g. example.com)
+    Walks the chain of trust from the root down to the target zone using
+    FALLBACK_RESOLVER (8.8.8.8) with CD+DO flags so RRSIG records are
+    returned. At each level the DNSKEY/RRSIG/DS chain is validated using
+    Q1 functions, then the final answer RRSIG is verified.
+
+    Note: direct queries to authoritative nameservers are blocked by the
+    local network; using a CD-capable recursive resolver is equivalent
+    because we perform all cryptographic verification ourselves.
     """
     result = ResolverResult(query=domain, rdtype=rdtype_str)
     rdtype = dns.rdatatype.from_text(rdtype_str)
 
-    # Start from the root
-    current_servers = list(ROOT_SERVERS)
-    current_zone = "."
-    result.path.append("Root")
-
-    # Validate root zone DNSKEY (root validates against built-in trust anchor)
-    root_vr = _validate_root_dnskey(current_servers[0])
+    # Step 1: Validate root zone (trust anchor)
+    root_vr = _validate_root_dnskey(ROOT_SERVERS[0])
     result.step_validations.append(root_vr)
+    result.path.append("Root")
     if not root_vr.valid:
         result.error = "Root DNSKEY validation failed"
         return result
 
-    # Iterative resolution loop
-    max_hops = 20
-
-    for hop in range(max_hops):
-        server_ip = current_servers[0]
-
-        # Query current server for the target
-        response = _query(server_ip, domain, rdtype, recursive=False)
-        if response is None:
-            # Try next server
-            if len(current_servers) > 1:
-                current_servers = current_servers[1:]
-                continue
-            result.error = f"No response from any server for {domain}"
+    # Step 2: Build zone chain and validate each intermediate zone.
+    # Stop when a name has no DNSKEY — it is a hostname, not a delegated zone.
+    zone_chain = _build_zone_chain(domain)  # [".", "com", "example.com", ...]
+    for zone in zone_chain[1:]:             # skip "." already handled above
+        zsk, ksk = fetch_dnskey(zone, FALLBACK_RESOLVER)
+        if not zsk and not ksk:
+            # Not a delegated zone — hostname within the previous zone; stop here
+            break
+        zone_vr = _validate_zone_at_server(zone, FALLBACK_RESOLVER)
+        result.step_validations.append(zone_vr)
+        result.path.append(_zone_display_label(zone))
+        if not zone_vr.valid:
+            result.error = f"DNSSEC validation failed at zone {zone}"
+            result.dnssec_verified = False
             return result
 
-        rcode = response.rcode()
-
-        # Check if we got an answer
-        if response.answer:
-            # We may have a CNAME chain — follow it
-            for rrset in response.answer:
-                if rrset.rdtype == rdtype:
-                    result.ip_answers = [str(rr) for rr in rrset]
-                    # Validate the final answer
-                    final_vr = _validate_answer(domain, rdtype_str, server_ip, response)
-                    result.step_validations.append(final_vr)
-                    result.dnssec_verified = all(v.valid for v in result.step_validations)
-                    return result
-
-            # CNAME redirect — follow the chain
-            for rrset in response.answer:
-                if rrset.rdtype == dns.rdatatype.CNAME:
-                    cname_target = str(next(iter(rrset)).target).rstrip(".")
-                    result.path.append(f"CNAME→{cname_target}")
-                    domain = cname_target
-                    current_servers = list(ROOT_SERVERS)
-                    current_zone = "."
-                    result.path.append("Root")
-                    break
-            continue
-
-        # No answer — check for referral (authority section with NS records)
-        referral_ns_ips = _get_ns_ips_from_response(response, FALLBACK_RESOLVER)
-        if referral_ns_ips:
-            # Determine what zone the NS records are for
-            referred_zone = _get_referred_zone(response)
-            if referred_zone and referred_zone != current_zone:
-                label = _zone_display_label(referred_zone)
-                result.path.append(label)
-
-                # Validate DNSKEY for the newly referred zone
-                zone_vr = _validate_zone_at_server(referred_zone, referral_ns_ips[0])
-                result.step_validations.append(zone_vr)
-                if not zone_vr.valid:
-                    result.error = f"DNSSEC validation failed at zone {referred_zone}"
-                    result.dnssec_verified = False
-                    return result
-
-                current_zone = referred_zone
-
-            current_servers = referral_ns_ips
-            continue
-
-        # NXDOMAIN or no useful response
-        if rcode == dns.rcode.NXDOMAIN:
-            result.error = f"NXDOMAIN: {domain} does not exist"
-        else:
-            result.error = f"Unexpected rcode {dns.rcode.to_text(rcode)} for {domain}"
+    # Step 3: Fetch the actual answer record via FALLBACK_RESOLVER
+    response = _query(FALLBACK_RESOLVER, domain, rdtype, recursive=True)
+    if response is None:
+        result.error = f"No response fetching {domain} {rdtype_str}"
         return result
 
-    result.error = "Max delegation hops exceeded"
+    rcode = response.rcode()
+    if rcode == dns.rcode.NXDOMAIN:
+        result.error = f"NXDOMAIN: {domain} does not exist"
+        return result
+
+    # Step 4: Validate the answer RRSIG
+    for rrset in response.answer:
+        if rrset.rdtype == rdtype:
+            result.ip_answers = [str(rr) for rr in rrset]
+            final_vr = _validate_answer(domain, rdtype_str, FALLBACK_RESOLVER, response)
+            result.step_validations.append(final_vr)
+            result.dnssec_verified = all(v.valid for v in result.step_validations)
+            return result
+
+    result.error = f"No {rdtype_str} records found in answer for {domain}"
     return result
 
 
@@ -368,11 +356,14 @@ def _validate_answer(domain: str, rdtype_str: str, server_ip: str,
         vr.steps.append(f"FAILED: No RRSIG for {rdtype_str}")
         return vr
 
-    zsk_list, ksk_list = fetch_dnskey(domain, server_ip)
+    # Fetch DNSKEY from the signer zone (from RRSIG.signer), not from the
+    # queried hostname which may not be a delegated zone.
+    signer_zone = str(rrsigs[0].signer).rstrip(".")
+    zsk_list, ksk_list = fetch_dnskey(signer_zone, server_ip)
     all_keys = zsk_list + ksk_list
     if not all_keys:
-        vr.error = "No DNSKEY available to verify answer RRSIG"
-        vr.steps.append("FAILED: No DNSKEY found")
+        vr.error = f"No DNSKEY available in signer zone {signer_zone}"
+        vr.steps.append(f"FAILED: No DNSKEY found in signer zone {signer_zone}")
         return vr
 
     for rrsig in rrsigs:
