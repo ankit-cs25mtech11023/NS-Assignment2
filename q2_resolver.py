@@ -14,11 +14,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
-import dns.name
-import dns.query
 import dns.message
 import dns.rdatatype
-import dns.flags
 import dns.rcode
 
 from q1_dnssec_validator import (
@@ -72,58 +69,12 @@ class ResolverResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_ns_ips_from_response(response: dns.message.Message, server_ip: str) -> list[str]:
-    """
-    Extract nameserver IPs from a DNS response.
-    First tries glue records in the additional section.
-    Falls back to resolving NS names via server_ip.
-    """
-    ns_names = []
-    glue: dict[str, str] = {}
-
-    # Prefer A over AAAA — only store AAAA if no A record exists for that name
-    for rrset in response.additional:
-        if rrset.rdtype == dns.rdatatype.A:
-            name = str(rrset.name).rstrip(".")
-            glue[name] = str(next(iter(rrset)))
-    for rrset in response.additional:
-        if rrset.rdtype == dns.rdatatype.AAAA:
-            name = str(rrset.name).rstrip(".")
-            if name not in glue:
-                glue[name] = str(next(iter(rrset)))
-
-    for section in (response.answer, response.authority):
-        for rrset in section:
-            if rrset.rdtype == dns.rdatatype.NS:
-                for rr in rrset:
-                    ns_names.append(str(rr.target).rstrip("."))
-
-    ns_ips = []
-    for name in ns_names:
-        if name in glue:
-            ns_ips.append(glue[name])
-        else:
-            # Resolve the NS hostname via our fallback resolver
-            for rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
-                resp = _query(FALLBACK_RESOLVER, name, rdtype)
-                if resp:
-                    for rrset in resp.answer:
-                        if rrset.rdtype == rdtype:
-                            ns_ips.append(str(next(iter(rrset))))
-                            break
-                if ns_ips and ns_ips[-1]:
-                    break
-
-    return ns_ips
-
-
-def _validate_zone_at_server(zone: str, server_ip: str) -> ValidationResult:
+def _validate_zone_at_server(zone: str) -> ValidationResult:
     """
     Validate DNSSEC for a zone.
-    DNSKEY/RRSIG records are fetched via FALLBACK_RESOLVER (8.8.8.8 with CD+DO)
-    because authoritative-only servers (TLD servers) refuse recursive queries.
-    Cryptographic verification is independent of which server we fetched from.
-    DS records are also fetched via FALLBACK_RESOLVER from the parent zone.
+    Fetches DNSKEY/RRSIG/DS via FALLBACK_RESOLVER (8.8.8.8 with CD+DO) so
+    that RRSIG records are preserved. Cryptographic verification is independent
+    of which server provided the data.
     """
     vr = ValidationResult(valid=False, domain=zone, record_type="DNSKEY")
 
@@ -236,7 +187,7 @@ def resolve_iterative(domain: str, rdtype_str: str) -> ResolverResult:
         if not zsk and not ksk:
             # Not a delegated zone — hostname within the previous zone; stop here
             break
-        zone_vr = _validate_zone_at_server(zone, FALLBACK_RESOLVER)
+        zone_vr = _validate_zone_at_server(zone)
         result.step_validations.append(zone_vr)
         result.path.append(_zone_display_label(zone))
         if not zone_vr.valid:
@@ -259,7 +210,7 @@ def resolve_iterative(domain: str, rdtype_str: str) -> ResolverResult:
     for rrset in response.answer:
         if rrset.rdtype == rdtype:
             result.ip_answers = [str(rr) for rr in rrset]
-            final_vr = _validate_answer(domain, rdtype_str, FALLBACK_RESOLVER, response)
+            final_vr = _validate_answer(domain, rdtype_str, response)
             result.step_validations.append(final_vr)
             result.dnssec_verified = all(v.valid for v in result.step_validations)
             return result
@@ -325,7 +276,7 @@ def _validate_root_dnskey(root_server_ip: str) -> ValidationResult:
     return vr
 
 
-def _validate_answer(domain: str, rdtype_str: str, server_ip: str,
+def _validate_answer(domain: str, rdtype_str: str,
                      response: dns.message.Message) -> ValidationResult:
     """Validate RRSIG over the final answer RRset."""
     from q1_dnssec_validator import _get_signing_key
@@ -359,7 +310,7 @@ def _validate_answer(domain: str, rdtype_str: str, server_ip: str,
     # Fetch DNSKEY from the signer zone (from RRSIG.signer), not from the
     # queried hostname which may not be a delegated zone.
     signer_zone = str(rrsigs[0].signer).rstrip(".")
-    zsk_list, ksk_list = fetch_dnskey(signer_zone, server_ip)
+    zsk_list, ksk_list = fetch_dnskey(signer_zone, FALLBACK_RESOLVER)
     all_keys = zsk_list + ksk_list
     if not all_keys:
         vr.error = f"No DNSKEY available in signer zone {signer_zone}"
@@ -377,14 +328,6 @@ def _validate_answer(domain: str, rdtype_str: str, server_ip: str,
     vr.error = "Answer RRSIG verification failed"
     vr.steps.append("FAILED: Answer RRSIG invalid")
     return vr
-
-
-def _get_referred_zone(response: dns.message.Message) -> Optional[str]:
-    """Extract the zone name from NS records in the authority section."""
-    for rrset in response.authority:
-        if rrset.rdtype == dns.rdatatype.NS:
-            return str(rrset.name).rstrip(".")
-    return None
 
 
 def _zone_display_label(zone: str) -> str:
